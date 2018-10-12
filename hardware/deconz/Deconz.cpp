@@ -6,9 +6,14 @@
 #include "../../main/localtime_r.h"
 #include "../../json/reader.h"
 #include "../../main/WebServer.h"
-#include <platform/Log.h>
+//#include <platform/Log.h>
 #include "../../main/mainworker.h"
 #include "../../main/SQLHelper.h"
+#include <boost/asio.hpp>
+#include <boost/beast.hpp>
+
+//using tcp = boost::asio::ip::tcp;               // from <boost/asio/ip/tcp.hpp>
+namespace websocket = boost::beast::websocket;  // from <boost/beast/websocket.hpp>
 
 Deconz::Deconz(const int id, const std::string& ipAddress, const unsigned short port,
                const std::string& username, const int poll, const int options)
@@ -38,29 +43,123 @@ void Deconz::Init()
 {
 }
 
+
+Json::Value Deconz::GetConfiguration()
+{
+	std::string result;
+	std::stringstream sstr2;
+
+	sstr2 << "http://" << ipAddress
+		<< ":" << port
+		<< "/api/" << username << "/config";
+	//Get Data
+	std::string sURL = sstr2.str();
+	std::vector<std::string> ExtraHeaders;
+	if (!HTTPClient::GET(sURL, ExtraHeaders, result))
+	{
+		_log.Log(LOG_ERROR, "%s: Error getting states. Please check settings...", DECONZ);
+		return false;
+	}	
+
+	Json::Value root;
+	Json::Reader jReader;
+	bool ret = jReader.parse(result, root);
+	if ((!ret) || (!root.isObject()))
+	{
+		_log.Log(LOG_ERROR, "%s: Invalid data received. Please verify settings.", DECONZ);
+		return false;
+	}
+
+	if (result.find("\"error\":") != std::string::npos)
+	{
+		//We had an error
+		_log.Log(LOG_ERROR, "%s: Error received: %s", DECONZ, root[0]["error"]["description"].asString().c_str());
+		return false;
+	}
+
+	return root;
+}
+
 bool Deconz::StartHardware()
 {
 	RequestStart();
 
+	isStopping = false;
+
+	// Request gateway configuration to get the port for
+	// WebSocket connection
+	auto config = GetConfiguration();
+		
 	thread = std::make_shared<std::thread>(&Deconz::Do_Work, this);
 	SetThreadName(thread->native_handle(), DECONZ);
 	m_bIsStarted = true;
 	sOnConnected(this);
+
+	if (config.isObject())
+	{
+		websocketport = (config["websocketport"] != Json::Value::null) ? config["websocketport"].asUInt() : 0;
+		websocketThread = std::make_shared<std::thread>(&Deconz::HandleWebsocket, this);
+		SetThreadName(websocketThread->native_handle(), "DECONZ-WS");
+	}
 
 	return (thread != nullptr);
 }
 
 bool Deconz::StopHardware()
 {
+	isStopping = true;
 	if (thread)
 	{
 		RequestStop();
 		thread->join();
 		thread.reset();
+
+		websocketThread->join();
+		websocketThread.reset();
 	}
 	m_bIsStarted = false;
 	return !m_bIsStarted;
 }
+
+void Deconz::HandleWebsocket()
+{
+	// connect Websocket
+	boost::asio::io_context ioc;
+	boost::asio::ip::tcp::resolver resolver{ ioc };
+	websocket::stream<boost::asio::ip::tcp::socket> ws{ ioc };
+	if (websocketport > 0) {
+		boost::asio::ip::tcp::resolver::query q{ ipAddress, std::to_string(websocketport) };
+		auto const results = resolver.resolve(q);
+		boost::asio::connect(ws.next_layer(), results.begin(), results.end());
+	}
+
+	ws.handshake(ipAddress, "/");
+	boost::beast::multi_buffer buffer;
+
+	while (!isStopping)
+	{
+		if (ws.is_open())
+		{			
+			ws.read(buffer);
+			if (buffer.size() > 0)
+			{
+				std::stringstream data;
+				data << boost::beast::buffers(buffer.data());
+				std::string stuff = data.str();
+
+				_log.Log(LOG_STATUS, "%s: Received event: %s", DECONZ, stuff.c_str());
+
+				// how logic to clear a buffer @vinniefalco... *clap* *clap* *clap*
+				buffer.consume(buffer.size());
+			}
+		}
+		sleep_milliseconds(1);
+	}
+
+	// close websocket
+	ws.close(websocket::close_code::normal);
+}
+
 
 void Deconz::Do_Work()
 {
@@ -69,9 +168,14 @@ void Deconz::Do_Work()
 
 	_log.Log(LOG_STATUS, "%s: Worker started...", DECONZ);
 
+	
+
 	while (!IsStopRequested(500))
 	{
 		msec_counter++;
+
+		
+
 		if (msec_counter == 2)
 		{
 			msec_counter = 0;
@@ -83,6 +187,9 @@ void Deconz::Do_Work()
 			}
 		}
 	}
+
+	
+
 	_log.Log(LOG_STATUS, "%s: Worker stopped...", DECONZ);
 }
 
@@ -121,7 +228,7 @@ bool Deconz::WriteToHardware(const char* pdata, const unsigned char length)
 			float fvalue = (254.0f / 100.0f)*float(pSwitch->level);
 			if (fvalue > 254.0f)
 				fvalue = 254.0f;
-			svalue = round(fvalue);
+			svalue = static_cast<int>(round(fvalue));
 		}
 		SwitchLight(nodeID, LCmd, svalue);
 	}

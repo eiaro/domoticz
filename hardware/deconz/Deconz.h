@@ -3,6 +3,7 @@
 #include "../DomoticzHardware.h"
 #include "DeconzLight.h"
 #include "DeconzSensor.h"
+#include "../../../../projects/vcpkg/installed/x86-windows/include/boost/system/error_code.hpp"
 
 namespace Json {
 	class Value;
@@ -20,9 +21,12 @@ public:
 	static std::string RegisterUser(const std::string &IPAddress, const unsigned short Port, const std::string &username);
 private:
 	void Init();
+	Json::Value GetConfiguration();
 	bool StartHardware() override;
 	bool StopHardware() override;
 	void Do_Work();
+	void HandleWebsocket();
+	void ReceivedEvent(boost::system::error_code ec, std::size_t bytes_transferred);
 	bool GetStates();
 	bool GetLights(const Json::Value &root);	
 	bool GetSensors(const Json::Value &root);
@@ -33,10 +37,13 @@ private:
 	int poll_interval;	
 	std::string ipAddress;
 	unsigned short port;
+	unsigned short websocketport;
 	std::string username;
 	std::shared_ptr<std::thread> thread;
+	std::shared_ptr<std::thread> websocketThread;
 	std::map<int, DeconzLight> lights;	
 	std::map<int, DeconzSensor> sensors;
+	bool isStopping;
 };
 
 
