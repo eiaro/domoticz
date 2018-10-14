@@ -2,11 +2,9 @@
 #include <string>
 #include "Deconz.h"
 #include "../../main/Logger.h"
-#include "../../main/EventsPythonDevice.h"
 #include "../../main/localtime_r.h"
 #include "../../json/reader.h"
 #include "../../main/WebServer.h"
-//#include <platform/Log.h>
 #include "../../main/mainworker.h"
 #include "../../main/SQLHelper.h"
 #include <boost/asio.hpp>
@@ -36,15 +34,14 @@ Deconz::Deconz(const int id, const std::string& ipAddress, const unsigned short 
 }
 
 Deconz::~Deconz()
-{
-}
+= default;
 
 void Deconz::Init()
 {
 }
 
 
-Json::Value Deconz::GetConfiguration()
+Json::Value Deconz::get_configuration() 
 {
 	std::string result;
 	std::stringstream sstr2;
@@ -88,7 +85,7 @@ bool Deconz::StartHardware()
 
 	// Request gateway configuration to get the port for
 	// WebSocket connection
-	auto config = GetConfiguration();
+	auto config = get_configuration();
 		
 	thread = std::make_shared<std::thread>(&Deconz::Do_Work, this);
 	SetThreadName(thread->native_handle(), DECONZ);
@@ -98,7 +95,7 @@ bool Deconz::StartHardware()
 	if (config.isObject())
 	{
 		websocketport = (config["websocketport"] != Json::Value::null) ? config["websocketport"].asUInt() : 0;
-		websocketThread = std::make_shared<std::thread>(&Deconz::HandleWebsocket, this);
+		websocketThread = std::make_shared<std::thread>(&Deconz::do_work_websocket, this);
 		SetThreadName(websocketThread->native_handle(), "DECONZ-WS");
 	}
 
@@ -121,36 +118,144 @@ bool Deconz::StopHardware()
 	return !m_bIsStarted;
 }
 
-void Deconz::HandleWebsocket()
+/**
+ * \brief Handling an received event.
+ * \param event_data String containing the JSON describing the event
+ */
+void Deconz::received_event(const std::string& event_data)
+{
+	Json::Value root;
+	Json::Reader reader;
+	const auto result = reader.parse(event_data, root);
+
+	if (result && root.isObject() && root.isMember("id")) // this may look strange, but scenes don't send id, so blocking them here :P
+	{
+		auto start_time = GetTimeMs64();
+
+		// id is actually passed as string, so...
+		const int id = atol(root.get("id",0).asCString());
+		const std::string resource = root["r"].asString();
+
+		if (resource == "sensors")
+		{
+			if (sensors.find(id) != sensors.end())
+			{
+				auto sensor = sensors[id];
+				sensor.process_event(root);
+				SendSensorUpdate(id, sensor, root, false);
+			}
+			
+		} else if (resource == "lights")
+		{
+			if (lights.find(id) != lights.end())
+			{
+				auto light = lights[id];
+				//light.handleEvent(root);
+			}			
+		}
+
+		auto elapsed = GetTimeMs64() - start_time;
+		_log.Log(LOG_STATUS, "%s: Handled event in %d ms", DECONZ, elapsed);
+	}
+}
+
+void Deconz::SendSensorUpdate(int id, DeconzSensor sensor, Json::Value root, const bool isNew)
+{
+	auto domoticzId = 0xA000 + (id << 8);
+	std::string devicename = sensor.type + " " + sensor.name;
+
+	if (sensor.type == "ZHAAlarm")
+	{
+
+	}
+	else if (sensor.type == "ZHACarbonMonoxide")
+	{
+
+	}
+	else if (sensor.type == "ZHAPresence")
+	{
+		if (isNew || root["state"].isMember("presence"))
+		{
+			InsertUpdateSwitch(domoticzId, STYPE_Motion, sensor.state.presence, devicename, sensor.config.battery);
+		}
+	}
+	else if (sensor.type == "ZHAFire")
+	{
+
+	}
+	else if (sensor.type == "ZHAHumidity")
+	{
+
+	}
+	else if (sensor.type == "ZHALightLevel")
+	{
+
+	}
+	else if (sensor.type == "ZHAOpenClose")
+	{
+
+	}
+	else if (sensor.type == "ZHAPressure")
+	{
+
+	}
+	else if (sensor.type == "ZHATemperature")
+	{
+
+	}
+	else if (sensor.type == "ZHAWater")
+	{
+
+	}
+	else if (sensor.type == "ZHAVibration")
+	{
+
+	}
+	else if (sensor.type == "ZHASwitch" || sensor.type == "ZGPSwitch")
+	{
+		if (root["state"].isMember("buttonevent"))
+		{
+			int button = (sensor.state.buttonevent / 1000);
+			InsertUpdateSwitch(domoticzId+button, STYPE_PushOn, true, devicename, sensor.config.battery);
+		}
+	}
+
+}
+
+/**
+ * \brief This is just reading the WebSocket and putting the read string into
+ * a queue for processing on the main thread. This will avoid race condition 
+ * on updates.
+ */
+void Deconz::do_work_websocket()
 {
 	// connect Websocket
 	boost::asio::io_context ioc;
 	boost::asio::ip::tcp::resolver resolver{ ioc };
 	websocket::stream<boost::asio::ip::tcp::socket> ws{ ioc };
 	if (websocketport > 0) {
-		boost::asio::ip::tcp::resolver::query q{ ipAddress, std::to_string(websocketport) };
+		boost::asio::ip::tcp::resolver::query q { ipAddress, std::to_string(websocketport) };
 		auto const results = resolver.resolve(q);
 		boost::asio::connect(ws.next_layer(), results.begin(), results.end());
 	}
 
 	ws.handshake(ipAddress, "/");
-	boost::beast::multi_buffer buffer;
+	
 
 	while (!isStopping)
 	{
 		if (ws.is_open())
-		{			
-			ws.read(buffer);
-			if (buffer.size() > 0)
+		{	
+			std::string data;
+			auto b = boost::asio::dynamic_buffer(data);
+			ws.read(b);
+			if (b.size() > 0)
 			{
-				std::stringstream data;
-				data << boost::beast::buffers(buffer.data());
-				std::string stuff = data.str();
+				_log.Log(LOG_STATUS, "%s: Received event: %s", DECONZ, data.c_str());
 
-				_log.Log(LOG_STATUS, "%s: Received event: %s", DECONZ, stuff.c_str());
-
-				// how logic to clear a buffer @vinniefalco... *clap* *clap* *clap*
-				buffer.consume(buffer.size());
+				std::unique_lock<std::mutex> lock(queueLock);
+				queue.push(data);
+				lock.unlock();
 			}
 		}
 		sleep_milliseconds(1);
@@ -167,14 +272,21 @@ void Deconz::Do_Work()
 	int sec_counter = poll_interval - 1;
 
 	_log.Log(LOG_STATUS, "%s: Worker started...", DECONZ);
-
 	
-
 	while (!IsStopRequested(500))
 	{
 		msec_counter++;
 
-		
+		while (!queue.empty())
+		{
+			std::string data;
+			std::unique_lock<std::mutex> lock(queueLock);
+			data = queue.front();
+			queue.pop();
+			lock.unlock();
+
+			received_event(data);
+		}
 
 		if (msec_counter == 2)
 		{
@@ -187,8 +299,6 @@ void Deconz::Do_Work()
 			}
 		}
 	}
-
-	
 
 	_log.Log(LOG_STATUS, "%s: Worker stopped...", DECONZ);
 }
@@ -268,7 +378,7 @@ bool Deconz::WriteToHardware(const char* pdata, const unsigned char length)
 				float fvalue = (254.0f / 100.0f)*float(pLed->value);
 				if (fvalue > 254.0f)
 					fvalue = 254.0f;
-				svalue = round(fvalue);
+				svalue = static_cast<int>(round(fvalue));
 				SwitchLight(nodeID, LCmd, svalue);
 			}
 			return true;
@@ -303,7 +413,7 @@ bool Deconz::WriteToHardware(const char* pdata, const unsigned char length)
 			else if (pLed->color.mode == ColorModeTemp)
 			{
 				LCmd = "Set CT";
-				svalue2 = round(float(pLed->color.t)*(500.0f - 153.0f) / 255.0f + 153.0f);
+				svalue2 = static_cast<int>(round(float(pLed->color.t)*(500.0f - 153.0f) / 255.0f + 153.0f));
 			}
 			else if (pLed->color.mode == ColorModeRGB)
 			{
@@ -312,8 +422,8 @@ bool Deconz::WriteToHardware(const char* pdata, const unsigned char length)
 				float cHue = (65535.0f)*hsb[0]; // Scale hue from 0..1 to 0..65535
 				float cSat = (254.0f)*hsb[1];   // Scale saturation from 0..1 to 0..254
 				LCmd = "Set Hue";
-				svalue2 = round(cHue);
-				svalue3 = round(cSat);
+				svalue2 = static_cast<int>(round(cHue));
+				svalue3 = static_cast<int>(round(cSat));
 			}
 			else {
 				_log.Log(LOG_STATUS, "%s: SetRGBColour - Color mode %d is unhandled, if you have a suggestion for what it should do, please post on the Domoticz forum", DECONZ, pLed->color.mode);
@@ -321,7 +431,7 @@ bool Deconz::WriteToHardware(const char* pdata, const unsigned char length)
 			float fvalue = (254.0f / 100.0f)*float(pLed->value);
 			if (fvalue > 254.0f)
 				fvalue = 254.0f;
-			svalue = round(fvalue);
+			svalue = static_cast<int>(round(fvalue));
 			SwitchLight(nodeID, LCmd, svalue, svalue2, svalue3);
 			return true;
 		}
@@ -578,7 +688,7 @@ bool Deconz::GetSensors(const Json::Value& root)
 
 			if (doSend)
 			{
-				int domoticzId = 3000 + sensorId;
+				auto domoticzId = 0xA000 + (sensorId << 8);
 				std::string deviceName = recSensor.type + " " + recSensor.name;
 
 				if (recSensor.type == "ZHAPresence")
@@ -606,7 +716,7 @@ bool Deconz::GetSensors(const Json::Value& root)
 }
 
 void Deconz::InsertUpdateSwitch(const int NodeID, const _eSwitchType SType, const bool status, const std::string& Name,
-                                const uint8_t BatteryLevel) const
+                                const uint8_t BatteryLevel)
 {
 	int sID = NodeID;
 	char ID[40];
@@ -647,6 +757,7 @@ void Deconz::InsertUpdateSwitch(const int NodeID, const _eSwitchType SType, cons
 	{
 		m_mainworker.PushAndWaitRxMessage(this, (const unsigned char *)&xcmd, Name.c_str(), BatteryLevel);
 	}
+
 }
 
 void Deconz::InsertUpdateSwitch(const int NodeID, const DeconzLight& light, const std::string& Options,
@@ -737,7 +848,7 @@ void Deconz::InsertUpdateSwitch(const int NodeID, const DeconzLight& light, cons
 			if (tstate.mode == LMODE_CT)
 			{
 				float iCt = (float(tstate.ct) - 153.0f) / (500.0f - 153.0f) * 255.0f;
-				color = _tColor(round(iCt), ColorModeTemp);
+				color = _tColor(static_cast<uint8_t>(round(iCt)), ColorModeTemp);
 			}
 			cmd = Color_SetColor;
 		}

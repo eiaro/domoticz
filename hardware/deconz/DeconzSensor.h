@@ -18,6 +18,7 @@ public:
 	SensorState();
 	SensorState(Json::Value state);
 	~SensorState();
+	bool process(Json::Value state);
 };
 
 class SensorConfig
@@ -33,16 +34,21 @@ public:
 	bool configured; // Daylight
 	SensorConfig();
 	SensorConfig(Json::Value config);
+	bool process(Json::Value config);
 	~SensorConfig();
 };
 
+// ReSharper disable CppInconsistentNaming
 class DeconzSensor : public DeconzNode
+	// ReSharper restore CppInconsistentNaming
 {
 public:
 	DeconzSensor(Json::Value sensor);
 	DeconzSensor();
 	SensorState state;
 	SensorConfig config;
+
+	bool process_event(Json::Value root);
 };
 
 
